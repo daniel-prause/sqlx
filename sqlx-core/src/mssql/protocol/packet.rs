@@ -12,7 +12,7 @@ pub(crate) struct PacketHeader {
     // Status is a bit field used to indicate the message state. Status is a 1-byte unsigned char.
     pub(crate) status: Status,
 
-    // Length is the size of the packet including the 8 bytes in the packet header.
+    // Length is the size of the packet. On the wire it includes the size of the packet header.
     pub(crate) length: u16,
 
     // The process ID on the server, corresponding to the current connection.
@@ -25,13 +25,27 @@ pub(crate) struct PacketHeader {
     pub(crate) packet_id: u8,
 }
 
-impl<'s> Encode<'s, &'s mut usize> for PacketHeader {
-    fn encode_with(&self, buf: &mut Vec<u8>, offset: &'s mut usize) {
+impl PacketHeader {
+    pub const SIZE: u16 = 8;
+
+    // update status after having written the packet
+    // used to mark the last packet
+    pub(crate) fn update_status(buf: &mut Vec<u8>, header_offset: usize, status: Status) {
+        let status_pos = header_offset + 1; // skip over `type` and we're there already
+        buf[status_pos] = status.bits();
+    }
+}
+
+impl<'s> Encode<'s, ()> for PacketHeader {
+    fn encode_with(&self, buf: &mut Vec<u8>, _: ()) {
         buf.push(self.r#type as u8);
         buf.push(self.status.bits());
 
-        *offset = buf.len();
-        buf.extend(&self.length.to_be_bytes());
+        // on the wire it should include the size of the packet header itself
+        // but that's not the responsibility of the code that uses this class
+        // to know about calculating the length
+        let total_length = self.length + Self::SIZE;
+        buf.extend(&total_length.to_be_bytes());
 
         buf.extend(&self.server_process_id.to_be_bytes());
         buf.push(self.packet_id);
@@ -46,7 +60,7 @@ impl Decode<'_> for PacketHeader {
         Ok(Self {
             r#type: PacketType::get(buf.get_u8())?,
             status: Status::from_bits_truncate(buf.get_u8()),
-            length: buf.get_u16(),
+            length: buf.get_u16() - Self::SIZE,
             server_process_id: buf.get_u16(),
             packet_id: buf.get_u8(),
         })

@@ -26,6 +26,8 @@ use std::sync::Arc;
 pub(crate) struct MssqlStream {
     inner: BufStream<MaybeTlsStream<TcpStream>>,
 
+    // negotiated packet size
+    pub(crate) packet_size: u16,
     // how many Done (or Error) we are currently waiting for
     pub(crate) pending_done_count: usize,
 
@@ -43,6 +45,8 @@ pub(crate) struct MssqlStream {
     pub(crate) column_names: Arc<HashMap<UStr, usize>>,
 }
 
+const DEFAULT_PACKET_SIZE: u16 = 4096;
+
 impl MssqlStream {
     pub(super) async fn connect(options: &MssqlConnectOptions) -> Result<Self, Error> {
         let inner = BufStream::new(MaybeTlsStream::Raw(
@@ -57,42 +61,46 @@ impl MssqlStream {
             pending_done_count: 0,
             transaction_descriptor: 0,
             transaction_depth: 0,
+            packet_size: DEFAULT_PACKET_SIZE,
         })
     }
 
-    // writes the packet out to the write buffer
-    // will (eventually) handle packet chunking
+    // writes the packet out to the write buffer, chunking as necessary
     pub(crate) fn write_packet<'en, T: Encode<'en>>(&mut self, ty: PacketType, payload: T) {
-        // TODO: Support packet chunking for large packet sizes
-        //       We likely need to double-buffer the writes so we know to chunk
-
-        // write out the packet header, leaving room for setting the packet length later
-
-        let mut len_offset = 0;
-
-        self.inner.write_with(
-            PacketHeader {
-                r#type: ty,
-                status: Status::END_OF_MESSAGE,
-                length: 0,
-                server_process_id: 0,
-                packet_id: 1,
-            },
-            &mut len_offset,
-        );
-
+        // in order to chunk into packets, write into separate buffer, then interleave
+        // packet headers as required
+        let mut full_msg: Vec<u8> = Vec::with_capacity(self.packet_size as usize);
         // write out the payload
-        self.inner.write(payload);
+        payload.encode(&mut full_msg);
 
-        // overwrite the packet length now that we know it
-        let len = self.inner.wbuf.len();
-        self.inner.wbuf[len_offset..(len_offset + 2)].copy_from_slice(&(len as u16).to_be_bytes());
+        let mut header_offset = 0;
+        // docs mention PacketID is ignored, but let's be good citizens and fill it in
+        let mut packet_id: u8 = 1;
+
+        let chunk_size = self.packet_size - PacketHeader::SIZE;
+        for chunk in full_msg.chunks(chunk_size as usize) {
+            header_offset = self.inner.wbuf.len();
+
+            self.inner.write(PacketHeader {
+                r#type: ty,
+                status: Status::NORMAL,
+                length: chunk.len() as u16,
+                server_process_id: 0,
+                packet_id,
+            });
+            packet_id = packet_id.wrapping_add(1);
+
+            self.inner.write(chunk);
+        }
+
+        // header_offset contains the offset of the last header, mark it as such
+        PacketHeader::update_status(&mut self.inner.wbuf, header_offset, Status::END_OF_MESSAGE);
     }
 
     // receive the next packet from the database
     // blocks until a packet is available
     pub(super) async fn recv_packet(&mut self) -> Result<(PacketHeader, Bytes), Error> {
-        let mut header: PacketHeader = self.inner.read(8).await?;
+        let mut header: PacketHeader = self.inner.read(PacketHeader::SIZE as usize).await?;
 
         // NOTE: From what I can tell, the response type from the server should ~always~
         //       be TabularResult. Here we expect that and die otherwise.
@@ -107,14 +115,14 @@ impl MssqlStream {
 
         loop {
             self.inner
-                .read_raw_into(&mut payload, (header.length - 8) as usize)
+                .read_raw_into(&mut payload, header.length as usize)
                 .await?;
 
             if header.status.contains(Status::END_OF_MESSAGE) {
                 break;
             }
 
-            header = self.inner.read(8).await?;
+            header = self.inner.read(PacketHeader::SIZE as usize).await?;
         }
 
         Ok((header, payload.freeze()))
@@ -144,6 +152,15 @@ impl MssqlStream {
 
                             EnvChange::CommitTransaction(_) | EnvChange::RollbackTransaction(_) => {
                                 self.transaction_descriptor = 0;
+                            }
+
+                            EnvChange::PacketSize(size) => {
+                                self.packet_size = size.parse::<u16>().map_err(|_| {
+                                    Error::protocol(format!(
+                                        "Failed to parse message size: {}",
+                                        size
+                                    ))
+                                })?;
                             }
 
                             _ => {}

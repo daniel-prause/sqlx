@@ -1,4 +1,4 @@
-use crate::database::{Database, HasArguments, HasStatement, HasValueRef};
+use crate::database::{Database, HasArguments, HasStatement, HasStatementCache, HasValueRef};
 use crate::mssql::{
     MssqlArguments, MssqlColumn, MssqlConnection, MssqlQueryResult, MssqlRow, MssqlStatement,
     MssqlTransactionManager, MssqlTypeInfo, MssqlValue, MssqlValueRef,
@@ -43,3 +43,5 @@ impl HasArguments<'_> for Mssql {
 
     type ArgumentBuffer = Vec<u8>;
 }
+
+impl HasStatementCache for Mssql {}
