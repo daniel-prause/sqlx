@@ -15,6 +15,7 @@ mod arguments;
 pub(crate) mod column;
 mod connection;
 mod database;
+mod error;
 mod kind;
 mod options;
 mod query_result;
@@ -31,6 +32,9 @@ mod migrate;
 pub use arguments::{AnyArgumentBuffer, AnyArguments};
 pub use column::{AnyColumn, AnyColumnIndex};
 pub use connection::AnyConnection;
+// Used internally in `sqlx-macros`
+#[doc(hidden)]
+pub use connection::AnyConnectionKind;
 pub use database::Any;
 pub use decode::AnyDecode;
 pub use encode::AnyEncode;
