@@ -1,6 +1,6 @@
 use futures::TryStreamExt;
+use sqlx::postgres::types::PgRange;
 use sqlx::{Connection, Executor, FromRow, Postgres};
-use sqlx_core::postgres::types::PgRange;
 use sqlx_test::{new, test_type};
 use std::fmt::Debug;
 use std::ops::Bound;
@@ -9,6 +9,13 @@ use std::ops::Bound;
 #[derive(PartialEq, Debug, sqlx::Type)]
 #[sqlx(transparent)]
 struct Transparent(i32);
+
+#[derive(PartialEq, Debug, sqlx::Type)]
+// https://github.com/launchbadge/sqlx/issues/2611
+// Previously, the derive would generate a `PgHasArrayType` impl that errored on an
+// impossible-to-satisfy `where` bound. This attribute allows the user to opt-out.
+#[sqlx(transparent, no_pg_array)]
+struct TransparentArray(Vec<i64>);
 
 #[sqlx_macros::test]
 async fn test_transparent_slice_to_array() -> anyhow::Result<()> {
@@ -137,6 +144,11 @@ struct RangeInclusive(PgRange<i32>);
 test_type!(transparent<Transparent>(Postgres,
     "0" == Transparent(0),
     "23523" == Transparent(23523)
+));
+
+test_type!(transparent_array<TransparentArray>(Postgres,
+    "'{}'::int8[]" == TransparentArray(vec![]),
+    "'{ 23523, 123456, 789 }'::int8[]" == TransparentArray(vec![23523, 123456, 789])
 ));
 
 test_type!(weak_enum<Weak>(Postgres,
@@ -376,6 +388,41 @@ SELECT $1 = ROW('fuzzy dice', 42, 199)::inventory_item, $1
 
 #[cfg(feature = "macros")]
 #[sqlx_macros::test]
+async fn test_new_type() {
+    struct NewType(i32);
+
+    impl From<i32> for NewType {
+        fn from(value: i32) -> Self {
+            NewType(value)
+        }
+    }
+
+    let mut conn = new::<Postgres>().await.unwrap();
+
+    struct NewTypeRow {
+        id: NewType,
+    }
+
+    let res = sqlx::query_as!(NewTypeRow, r#"SELECT 1 as "id!""#)
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+    assert_eq!(res.id.0, 1);
+
+    struct NormalRow {
+        id: i32,
+    }
+
+    let res = sqlx::query_as!(NormalRow, r#"SELECT 1 as "id!""#)
+        .fetch_one(&mut conn)
+        .await
+        .unwrap();
+
+    assert_eq!(res.id, 1);
+}
+
+#[cfg(feature = "macros")]
+#[sqlx_macros::test]
 async fn test_from_row() -> anyhow::Result<()> {
     let mut conn = new::<Postgres>().await?;
 
@@ -610,6 +657,34 @@ async fn test_flatten() -> anyhow::Result<()> {
     assert_eq!(1, account.id);
     assert_eq!("foo", account.info.name);
     assert_eq!("bar", account.info.surname);
+    assert_eq!(None, account.default.default);
+
+    Ok(())
+}
+
+#[cfg(feature = "macros")]
+#[sqlx_macros::test]
+async fn test_skip() -> anyhow::Result<()> {
+    #[derive(Debug, Default, sqlx::FromRow)]
+    struct AccountDefault {
+        default: Option<i32>,
+    }
+
+    #[derive(Debug, sqlx::FromRow)]
+    struct AccountKeyword {
+        id: i32,
+        #[sqlx(skip)]
+        default: AccountDefault,
+    }
+
+    let mut conn = new::<Postgres>().await?;
+
+    let account: AccountKeyword = sqlx::query_as(r#"SELECT * from (VALUES (1)) accounts("id")"#)
+        .fetch_one(&mut conn)
+        .await?;
+    println!("{:?}", account);
+
+    assert_eq!(1, account.id);
     assert_eq!(None, account.default.default);
 
     Ok(())

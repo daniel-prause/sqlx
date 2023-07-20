@@ -1,8 +1,10 @@
-use anyhow::Result;
-use futures::{Future, TryFutureExt};
-use sqlx::{AnyConnection, Connection};
 use std::io;
 use std::time::Duration;
+
+use anyhow::Result;
+use futures::{Future, TryFutureExt};
+
+use sqlx::{AnyConnection, Connection};
 
 use crate::opt::{Command, ConnectOpts, DatabaseCommand, MigrateCommand};
 
@@ -10,6 +12,8 @@ mod database;
 mod metadata;
 // mod migration;
 // mod migrator;
+#[cfg(feature = "completions")]
+mod completions;
 mod migrate;
 mod opt;
 mod prepare;
@@ -23,42 +27,24 @@ pub async fn run(opt: Opt) -> Result<()> {
                 source,
                 description,
                 reversible,
-            } => migrate::add(source.resolve(&migrate.source), &description, reversible).await?,
+            } => migrate::add(&source, &description, reversible).await?,
             MigrateCommand::Run {
                 source,
                 dry_run,
                 ignore_missing,
                 connect_opts,
-            } => {
-                migrate::run(
-                    source.resolve(&migrate.source),
-                    &connect_opts,
-                    dry_run,
-                    *ignore_missing,
-                )
-                .await?
-            }
+            } => migrate::run(&source, &connect_opts, dry_run, *ignore_missing).await?,
             MigrateCommand::Revert {
                 source,
                 dry_run,
                 ignore_missing,
                 connect_opts,
-            } => {
-                migrate::revert(
-                    source.resolve(&migrate.source),
-                    &connect_opts,
-                    dry_run,
-                    *ignore_missing,
-                )
-                .await?
-            }
+            } => migrate::revert(&source, &connect_opts, dry_run, *ignore_missing).await?,
             MigrateCommand::Info {
                 source,
                 connect_opts,
-            } => migrate::info(source.resolve(&migrate.source), &connect_opts).await?,
-            MigrateCommand::BuildScript { source, force } => {
-                migrate::build_script(source.resolve(&migrate.source), force)?
-            }
+            } => migrate::info(&source, &connect_opts).await?,
+            MigrateCommand::BuildScript { source, force } => migrate::build_script(&source, force)?,
         },
 
         Command::Database(database) => match database.command {
@@ -79,18 +65,14 @@ pub async fn run(opt: Opt) -> Result<()> {
         },
 
         Command::Prepare {
-            check: false,
-            merged,
-            args,
+            check,
+            workspace,
             connect_opts,
-        } => prepare::run(&connect_opts, merged, args).await?,
+            args,
+        } => prepare::run(check, workspace, connect_opts, args).await?,
 
-        Command::Prepare {
-            check: true,
-            merged,
-            args,
-            connect_opts,
-        } => prepare::check(&connect_opts, merged, args).await?,
+        #[cfg(feature = "completions")]
+        Command::Completions { shell } => completions::run(shell),
     };
 
     Ok(())
@@ -113,6 +95,8 @@ where
     F: FnMut(&'a str) -> Fut,
     Fut: Future<Output = sqlx::Result<T>> + 'a,
 {
+    sqlx::any::install_default_drivers();
+
     backoff::future::retry(
         backoff::ExponentialBackoffBuilder::new()
             .with_max_elapsed_time(Some(Duration::from_secs(opts.connect_timeout)))
